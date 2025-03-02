@@ -1,0 +1,8 @@
+matplotlib
+rioxarray
+numpy
+planetary-computer
+pystac-client
+geopandas
+scikit-image
+basemap

@@ -1,2 +1,21 @@
-*.pyc
+# Environment variables
 .env
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Local development settings
+.idea/
+.vscode/
+/fire_info
+/satellite_images
+/cache
+/fire_imagery
+temp_firms_VIIRS_NOAA20_NRT.csv

@@ -1,6 +1,6 @@
 # Fire Satellite Image Crawler
 
-A Python tool that uses Microsoft Planetary Computer to find and download high-quality satellite images of fire events.
+This tool fetches and processes satellite imagery data related to fire events using NASA's Earth API and Google Earth Engine.
 
 ## Features
 
@@ -11,22 +11,37 @@ A Python tool that uses Microsoft Planetary Computer to find and download high-q
 - Automatic cloud cover filtering for best quality
 - Batch download with progress tracking
 
-## Installation
+## Setup
+
+### Requirements
+
+- Python 3.7 or higher
+- Google Earth Engine account
+- NASA API key
+
+### Installation
 
 1. Clone this repository:
-```bash
-git clone https://github.com/yourusername/fire-satellite-image-crawler.git
-cd fire-satellite-image-crawler
-```
+   ```
+   git clone https://github.com/yourusername/fire-satellite-image-crawler.git
+   cd fire-satellite-image-crawler
+   ```
 
 2. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+   ```
+   pip install -r requirements.txt
+   ```
 
-3. Set up Microsoft Planetary Computer authentication:
-   - Sign up for an API key at [Microsoft Planetary Computer](https://planetarycomputer.microsoft.com/)
-   - Add your API key to the `config.py` file or use the `--mpc_api_key` parameter
+3. Setup environment variables:
+   Create a `.env` file in the project root with:
+   ```
+   NASA_API_KEY=your_nasa_api_key
+   PROJECT-ID=your_gee_project_id
+   ```
+
+### Google Earth Engine Authentication
+
+Before running the script for the first time, you need to authenticate with Google Earth Engine:
 
 ## Usage
 
