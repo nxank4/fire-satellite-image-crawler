@@ -14,6 +14,7 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
+# Add new option
 
 import pandas as pd
 from tqdm import tqdm

@@ -293,7 +293,7 @@ def _get_pre_fire_image(fire_row, days_before=30, buffer_size=0.05):
             items = _search_planetary_computer(area_of_interest, time_of_interest, 30)
 
             if not items:
-                print(f"No suitable pre-fire images found in extended window")
+                print("No suitable pre-fire images found in extended window")
                 return None
 
         # Select the best image
@@ -435,11 +435,10 @@ def _visualize_classified_dnbr(
         fig = plt.figure(figsize=(10, 10 / aspect_ratio))
 
         # Plot the classified array
-        im = plt.imshow(classified, cmap=burn_cmap, vmin=0, vmax=6)
+        plt.imshow(classified, cmap=burn_cmap, vmin=0, vmax=6)
 
         # Create custom legend
         from matplotlib.patches import Patch
-        from matplotlib.lines import Line2D
 
         legend_elements = [
             Patch(facecolor=colors[0], label="Enhanced regrowth, high"),
