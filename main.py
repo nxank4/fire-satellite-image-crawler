@@ -13,7 +13,11 @@ import traceback
 import warnings
 from datetime import datetime
 from pathlib import Path
+import concurrent
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
+import gc
 # Add new option
 
 import pandas as pd
@@ -22,7 +26,10 @@ from tqdm import tqdm
 # Import processor modules
 from processors.fire_data import filter_fire_data, load_fire_data
 from processors.sentinel import get_sentinel_image
-from utils.visualization import create_direct_composite_visualization
+from utils.visualization import (
+    create_direct_composite_visualization,
+    convert_png_to_jpg,
+)
 from config import OUTPUT_DIR, CACHE_DIR
 
 # Suppress warnings to keep output clean
@@ -30,12 +37,6 @@ warnings.filterwarnings("ignore")
 
 # Load environment variables including NASA_FIRMS_KEY
 load_dotenv()
-nasa_firms_key = os.getenv("NASA_FIRMS_KEY")
-
-if not nasa_firms_key:
-    print(
-        "WARNING: NASA_FIRMS_KEY environment variable is not set. MWIR data will not be available."
-    )
 
 
 def save_image(
@@ -44,8 +45,9 @@ def save_image(
     asset_key="visual",
     output_dir=None,
     buffer_size=0.05,
-    dpi=300,
-    organize_by_date=True,  # New parameter for date-based organization
+    dpi=200,
+    organize_by_date=True,
+    resize_large_images=True,
 ):
     """
     Save an image from a Sentinel STAC item.
@@ -166,10 +168,27 @@ def save_image(
                 # Create a grayscale RGB array
                 image_array = np.stack([normalized, normalized, normalized], axis=2)
 
-        # Check if we have a valid image array
-        if image_array is None:
-            print(f"Failed to create image array for {fire_id} {asset_key}")
-            return None
+        # Before saving, check if image is very large and needs resizing
+        if resize_large_images and image_array is not None:
+            height, width = image_array.shape[:2]
+            max_dimension = 1200  # Maximum dimension to allow
+
+            if height > max_dimension or width > max_dimension:
+                # Calculate new dimensions maintaining aspect ratio
+                if height > width:
+                    new_height = max_dimension
+                    new_width = int(width * (max_dimension / height))
+                else:
+                    new_width = max_dimension
+                    new_height = int(height * (width / max_dimension))
+
+                # Import only when needed
+                from skimage.transform import resize
+
+                # Resize image - significantly reduces processing and file size
+                image_array = resize(
+                    image_array, (new_height, new_width), preserve_range=True
+                ).astype(np.uint8)
 
         # Save the image
         import matplotlib.pyplot as plt
@@ -291,6 +310,22 @@ def parse_arguments():
         dest="organize_by_date",
         help="Don't organize outputs in date-based folders",
     )
+    parser.add_argument(
+        "--optimize-storage",
+        action="store_true",
+        help="Convert existing PNG images to JPG format to save storage space",
+    )
+    parser.add_argument(
+        "--delete-originals",
+        action="store_true",
+        help="Delete original PNG files after converting to JPG (use with --optimize-storage)",
+    )
+    parser.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=85,
+        help="JPEG quality (0-100) when optimizing storage (use with --optimize-storage)",
+    )
 
     # Check if run with arguments
     if len(sys.argv) > 1:
@@ -387,7 +422,6 @@ def process_fire_record(fire_row, args, dirs):
             add_timestamp=False,
             buffer_size=args.buffer_size,
             organize_by_date=True,  # Explicitly set for consistency
-            nasa_firms_key=nasa_firms_key,
         )
         results["composite"] = composite_path
 
@@ -402,18 +436,47 @@ def process_fire_record(fire_row, args, dirs):
 
 
 def process_batch(batch, args, dirs):
-    """Process a batch of fire records with progress tracking."""
+    """Process a batch of fire records with parallel processing."""
+
+    # Calculate optimal worker count
+    max_workers = min(32, multiprocessing.cpu_count() + 4)
     processed_count = 0
     success_count = 0
+    results = []
 
-    for _, fire_row in tqdm(list(batch.iterrows()), desc="Processing"):
-        results, success = process_fire_record(fire_row, args, dirs)
+    # Define processing function for a single record
+    def process_single(row_data):
+        _, fire_row = row_data
+        try:
+            result, success = process_fire_record(fire_row, args, dirs)
+            return (result, success, fire_row.name)
+        except Exception as e:
+            print(f"Error processing record {fire_row.name}: {str(e)}")
+            return (None, False, fire_row.name)
 
-        if success:
-            success_count += 1
+    # Process in parallel
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(process_single, row): row for row in batch.iterrows()
+        }
 
-        if results is not None:
-            processed_count += 1
+        # Show progress bar
+        from tqdm import tqdm
+
+        for future in tqdm(
+            concurrent.futures.as_completed(futures),
+            total=len(futures),
+            desc="Processing",
+        ):
+            result, success, idx = future.result()
+
+            if success:
+                success_count += 1
+
+            if result is not None:
+                processed_count += 1
+
+            results.append((idx, result, success))
 
     return processed_count, success_count
 
@@ -425,6 +488,40 @@ def main():
     try:
         # Parse command line arguments
         args = parse_arguments()
+
+        # Check if we should run storage optimization
+        if args.optimize_storage:
+            from utils.visualization import batch_optimize_images
+
+            print(f"\n{'=' * 60}")
+            print("Fire Satellite Image Crawler - Storage Optimization")
+            print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"{'=' * 60}")
+            print("Running storage optimization for existing images...")
+
+            batch_optimize_images(
+                directory=args.output_dir,
+                recursive=True,
+                delete_originals=args.delete_originals,
+                jpeg_quality=args.jpeg_quality,
+            )
+
+            # Calculate and display execution time
+            elapsed_time = time.time() - start_time
+            hours, rem = divmod(elapsed_time, 3600)
+            minutes, seconds = divmod(rem, 60)
+
+            print(f"\n{'=' * 60}")
+            print(
+                f"Optimization complete at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            print(
+                f"Total execution time: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
+            )
+            print(f"{'=' * 60}")
+
+            # Exit after optimization
+            return
 
         # Print selected options
         print(f"\n{'=' * 60}")
@@ -439,6 +536,7 @@ def main():
         print(f"  Caching: {'disabled' if args.no_cache else 'enabled'}")
         print(f"  Output directory: {args.output_dir}")
         print(f"  Create composites: {'yes' if args.create_composites else 'no'}")
+        print(f"  Organize by date: {'yes' if args.organize_by_date else 'no'}")
 
         # Setup directory structure
         dirs = setup_directories(args.output_dir)
@@ -479,6 +577,12 @@ def main():
             print(
                 f"Batch {batch_start // batch_size + 1} complete: {success} successful, {batch_end - batch_start - processed} skipped"
             )
+
+            # Force garbage collection between batches to free memory
+            gc.collect()
+
+            # Short delay to let system stabilize
+            time.sleep(1)
 
         # Calculate and display execution time
         elapsed_time = time.time() - start_time

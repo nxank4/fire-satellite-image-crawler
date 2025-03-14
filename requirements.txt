@@ -6,3 +6,4 @@ pystac-client
 geopandas
 scikit-image
 basemap
+skimage
