@@ -19,3 +19,6 @@ build/
 /cache
 /fire_imagery
 temp_firms_VIIRS_NOAA20_NRT.csv
+/data_csv
+/data_image
+/output

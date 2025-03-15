@@ -1,619 +1,856 @@
 """
-Fire Satellite Image Crawler - Main Module
-
-This script processes satellite imagery for wildfire events,
-creating various visualizations for analysis.
+MODIS imagery processing script for fire hotspot regions using Google Earth Engine
+Author: lunovian
+Last updated: 2025-03-15
 """
 
-import argparse
+import concurrent
+import ee
+import matplotlib.pyplot as plt
+import numpy as np
+from datetime import datetime, timedelta
 import os
+import pandas as pd
+from rich.console import Console
+from rich.progress import track
+import tempfile
+import requests
 import sys
 import time
-import traceback
-import warnings
-from datetime import datetime
-from pathlib import Path
-import concurrent
-from dotenv import load_dotenv
-from concurrent.futures import ThreadPoolExecutor
-import multiprocessing
-import gc
-# Add new option
+import matplotlib
+import argparse
+import concurrent.futures
+import signal
 
-import pandas as pd
-from tqdm import tqdm
+console = Console()
 
-# Import processor modules
-from processors.fire_data import filter_fire_data, load_fire_data
-from processors.sentinel import get_sentinel_image
-from utils.visualization import (
-    create_direct_composite_visualization,
-    convert_png_to_jpg,
-)
-from config import OUTPUT_DIR, CACHE_DIR
-
-# Suppress warnings to keep output clean
-warnings.filterwarnings("ignore")
-
-# Load environment variables including NASA_FIRMS_KEY
-load_dotenv()
+# Initialize Earth Engine
+try:
+    ee.Initialize(project="ee-nxan2911-fire")
+    print("Earth Engine initialized successfully")
+except Exception as e:
+    print(f"Error initializing Earth Engine: {str(e)}")
+    print(
+        "Make sure you have authenticated with Earth Engine (run 'earthengine authenticate' in terminal)"
+    )
+    sys.exit(1)
 
 
-def save_image(
-    sentinel_item,
-    fire_row,
-    asset_key="visual",
-    output_dir=None,
-    buffer_size=0.05,
-    dpi=200,
-    organize_by_date=True,
-    resize_large_images=True,
-):
-    """
-    Save an image from a Sentinel STAC item.
-
-    Args:
-        sentinel_item: STAC item from Sentinel-2
-        fire_row: GeoDataFrame row with fire information
-        asset_key: The key for the asset to save (default: "visual")
-        output_dir: Directory to save the image
-        buffer_size: Buffer size in degrees around the point
-        dpi: Resolution for the output image
-        organize_by_date: Whether to organize outputs by date folders (default: True)
-
-    Returns:
-        str or None: Path to the saved image or None if failed
-    """
+def load_fire_data(csv_path):
+    """Load fire data from CSV file"""
     try:
-        # Set up output directory with date-based organization if requested
-        output_dir = Path(output_dir)
-
-        # Extract fire date information if organizing by date
-        if organize_by_date:
-            import pandas as pd
-
-            fire_date = pd.to_datetime(fire_row.acq_date)
-            fire_year = fire_date.strftime("%Y")
-            fire_month = fire_date.strftime("%m")
-            output_dir = output_dir / fire_year / fire_month
-
-        # Create output directory
-        output_dir.mkdir(exist_ok=True, parents=True)
-
-        # Generate fire ID for consistent naming
-        if organize_by_date:
-            # Simpler ID if date is in folder structure
-            fire_id = f"fire_{fire_row.geometry.y:.4f}_{fire_row.geometry.x:.4f}"
-        else:
-            # Include date in filename
-            fire_id = f"fire_{fire_row.acq_date}_{fire_row.geometry.y:.4f}_{fire_row.geometry.x:.4f}"
-
-        # Create output path
-        output_path = output_dir / f"{fire_id}_{asset_key}.png"
-
-        # Check if file already exists
-        if output_path.exists():
-            print(f"Image already exists at {output_path}")
-            return str(output_path)
-
-        # For visual assets, use create_rgb_array
-        if asset_key == "visual" or asset_key in ["true-color", "true_color"]:
-            from processors.sentinel import create_rgb_array
-
-            image_array = create_rgb_array(
-                sentinel_item, fire_row, buffer_size=buffer_size, auto_adjust=True
-            )
-
-        # For other specific bands, process appropriately
-        elif asset_key == "nir":
-            from processors.nir import create_nir_array
-
-            image_array = create_nir_array(
-                sentinel_item, fire_row, buffer_size=buffer_size
-            )
-
-        elif asset_key == "swir":
-            from processors.swir import create_swir_array
-
-            image_array = create_swir_array(
-                sentinel_item, fire_row, buffer_size=buffer_size
-            )
-
-        elif asset_key == "fire_composite":
-            from processors.fire_composite import create_fire_composite_array
-
-            image_array = create_fire_composite_array(
-                sentinel_item, fire_row, buffer_size=buffer_size
-            )
-
-        # For raw assets from the STAC item
-        else:
-            # Check if the asset exists in the STAC item
-            if asset_key not in sentinel_item.assets:
-                print(f"Asset key '{asset_key}' not found in STAC item")
-                return None
-
-            # Create a grayscale visualization from a single band
-            import planetary_computer as pc
-            import rasterio
-            from rasterio import features, windows, warp
-            import numpy as np
-
-            # Get the asset URL
-            asset_href = pc.sign(sentinel_item.assets[asset_key].href)
-
-            # Create buffer around point
-            point_buffer = fire_row.geometry.buffer(buffer_size)
-            aoi_bounds = features.bounds(point_buffer.__geo_interface__)
-
-            # Open the asset and read data
-            with rasterio.open(asset_href) as ds:
-                warped_aoi_bounds = warp.transform_bounds(
-                    "epsg:4326", ds.crs, *aoi_bounds
-                )
-                aoi_window = windows.from_bounds(
-                    *warped_aoi_bounds, transform=ds.transform
-                )
-                band_data = ds.read(1, window=aoi_window)
-
-                # Normalize for visualization
-                p_low = np.percentile(band_data, 2)
-                p_high = np.percentile(band_data, 98)
-
-                if p_high > p_low:
-                    normalized = np.clip((band_data - p_low) / (p_high - p_low), 0, 1)
-                else:
-                    normalized = np.zeros_like(band_data, dtype=float)
-
-                # Create a grayscale RGB array
-                image_array = np.stack([normalized, normalized, normalized], axis=2)
-
-        # Before saving, check if image is very large and needs resizing
-        if resize_large_images and image_array is not None:
-            height, width = image_array.shape[:2]
-            max_dimension = 1200  # Maximum dimension to allow
-
-            if height > max_dimension or width > max_dimension:
-                # Calculate new dimensions maintaining aspect ratio
-                if height > width:
-                    new_height = max_dimension
-                    new_width = int(width * (max_dimension / height))
-                else:
-                    new_width = max_dimension
-                    new_height = int(height * (width / max_dimension))
-
-                # Import only when needed
-                from skimage.transform import resize
-
-                # Resize image - significantly reduces processing and file size
-                image_array = resize(
-                    image_array, (new_height, new_width), preserve_range=True
-                ).astype(np.uint8)
-
-        # Save the image
-        import matplotlib.pyplot as plt
-
-        # Get image dimensions for figure size
-        height, width = image_array.shape[:2]
-        fig_width = width / dpi
-        fig_height = height / dpi
-
-        # Create figure and save image
-        fig = plt.figure(figsize=(fig_width, fig_height), frameon=False)
-        ax = plt.Axes(fig, [0.0, 0.0, 1.0, 1.0])
-        ax.set_axis_off()
-        fig.add_axes(ax)
-
-        # Display the image
-        ax.imshow(image_array)
-
-        # Save image
-        plt.savefig(output_path, dpi=dpi, bbox_inches="tight", pad_inches=0)
-        plt.close(fig)
-
-        print(f"Saved {asset_key} image to {output_path}")
-        return str(output_path)
-
+        df = pd.read_csv(csv_path)
+        print(f"Loaded {len(df)} fire hotspots from {csv_path}")
+        return df
     except Exception as e:
-        print(f"Error saving {asset_key} image: {str(e)}")
-        traceback.print_exc()
+        print(f"Error loading fire data: {str(e)}")
         return None
 
 
-def parse_arguments():
-    """Parse command line arguments with sensible defaults."""
-    parser = argparse.ArgumentParser(
-        description="Process satellite imagery for fire locations",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+def filter_fire_data(df, min_confidence=50, max_hotspots=10):
+    """Filter fire data to get high-confidence hotspots"""
+    # Filter by confidence
+    filtered = df[df["confidence"] >= min_confidence]
 
-    # Processing options
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=100,
-        help="Number of fire records to process in each batch",
-    )
-    parser.add_argument(
-        "--cloud-limit",
-        type=int,
-        default=10,
-        help="Maximum cloud cover percentage (0-100)",
-    )
-    parser.add_argument(
-        "--search-days",
-        type=int,
-        default=10,
-        help="Days before/after fire date to search for images",
-    )
-    parser.add_argument(
-        "--buffer-size",
-        type=float,
-        default=0.05,
-        help="Buffer size around fire points in degrees",
-    )
+    # Sort by brightness (descending)
+    sorted_df = filtered.sort_values(by="brightness", ascending=False)
 
-    # Filtering options
-    parser.add_argument(
-        "--sample",
-        type=int,
-        default=0,
-        help="Process only a sample of N records (0 for all)",
-    )
-    parser.add_argument(
-        "--no-cache", action="store_true", help="Disable caching of Sentinel images"
-    )
-    parser.add_argument(
-        "--filter-high-confidence",
-        action="store_true",
-        help="Filter out high confidence fire detections",
-    )
-    parser.add_argument(
-        "--start-idx", type=int, default=0, help="Start processing from this index"
-    )
-    parser.add_argument(
-        "--date-range", type=str, help="Filter by date range (YYYY-MM-DD:YYYY-MM-DD)"
-    )
-    parser.add_argument(
-        "--region",
-        type=str,
-        help="Filter by geographic region: 'country:COUNTRYNAME' or 'bbox:west,south,east,north'",
-    )
+    # Take top N hotspots
+    result = sorted_df.head(max_hotspots)
 
-    # Output options
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=OUTPUT_DIR,
-        help="Base directory for output files",
-    )
-    parser.add_argument(
-        "--create-composites",
-        action="store_true",
-        help="Create multi-panel composite visualizations for each fire",
-    )
-    parser.add_argument(
-        "--nasa-firms-key",
-        type=str,
-        default="",
-        help="NASA FIRMS API key for accessing MWIR data",
-    )
-    parser.add_argument(
-        "--organize-by-date",
-        action="store_true",
-        default=True,
-        help="Organize outputs in Year/Month folders (default: True)",
-    )
-    parser.add_argument(
-        "--no-date-folders",
-        action="store_false",
-        dest="organize_by_date",
-        help="Don't organize outputs in date-based folders",
-    )
-    parser.add_argument(
-        "--optimize-storage",
-        action="store_true",
-        help="Convert existing PNG images to JPG format to save storage space",
-    )
-    parser.add_argument(
-        "--delete-originals",
-        action="store_true",
-        help="Delete original PNG files after converting to JPG (use with --optimize-storage)",
-    )
-    parser.add_argument(
-        "--jpeg-quality",
-        type=int,
-        default=85,
-        help="JPEG quality (0-100) when optimizing storage (use with --optimize-storage)",
-    )
+    print(f"Filtered to {len(result)} high-confidence fire hotspots")
+    return result
 
-    # Check if run with arguments
-    if len(sys.argv) > 1:
-        args = parser.parse_args()
+
+def save_visualization_as_png(fig, output_dir, prefix="modis_visualization"):
+    """Save matplotlib figure as PNG"""
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filepath = os.path.join(output_dir, f"{prefix}_{timestamp}.png")
+    fig.savefig(filepath, dpi=300, bbox_inches="tight")
+    print(f"Visualization saved to: {filepath}")
+    return filepath
+
+
+def download_ee_image(url, output_path, max_retries=3, retry_delay=2):
+    """
+    Download an image from a URL and save it to the specified path.
+    Includes retry logic for resilience against temporary network issues.
+    """
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, stream=True, timeout=30)  # Added timeout
+            if response.status_code == 200:
+                with open(output_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=1024):
+                        f.write(chunk)
+                return True
+            elif response.status_code == 429:  # Too Many Requests
+                console.print(
+                    "[yellow]Rate limited (429). Waiting longer before retry...[/yellow]"
+                )
+                time.sleep(retry_delay * 5)  # Wait longer for rate limiting
+            else:
+                console.print(
+                    f"[yellow]Failed to download image: HTTP {response.status_code}. Attempt {attempt + 1}/{max_retries}[/yellow]"
+                )
+                time.sleep(retry_delay)
+        except requests.RequestException as e:
+            console.print(
+                f"[yellow]Network error during download: {str(e)}. Attempt {attempt + 1}/{max_retries}[/yellow]"
+            )
+            time.sleep(retry_delay)
+
+    console.print(
+        f"[bold red]Failed to download image after {max_retries} attempts[/bold red]"
+    )
+    return False
+
+
+def get_modis_composite(start_date, end_date, roi, satellite="Terra"):
+    """Get a MODIS composite image for the specified time range, region of interest and satellite"""
+    # Select the appropriate MODIS collection based on satellite
+    if satellite.lower() == "aqua":
+        # Aqua MODIS
+        daily_collection = "MODIS/061/MYD09GQ"  # Daily 250m
+        eight_day_collection = "MODIS/061/MYD09A1"  # 8-day 500m
     else:
-        # Use defaults if no arguments provided
-        args = parser.parse_args([])
-        print("Using default settings. Run with --help for customization options.")
+        # Default to Terra MODIS
+        daily_collection = "MODIS/061/MOD09GQ"  # Daily 250m
+        eight_day_collection = "MODIS/061/MOD09A1"  # 8-day 500m
 
-    return args
+    # Try to get daily data first (higher temporal resolution)
+    daily_modis = ee.ImageCollection(daily_collection).filterDate(start_date, end_date)
 
+    # If we have daily data, use it; otherwise fall back to 8-day composite
+    if daily_modis.size().getInfo() > 0:
+        print(f"Using daily {satellite} MODIS data")
+        composite = daily_modis.median()
+    else:
+        print(f"No daily data available, using 8-day {satellite} MODIS composite")
+        eight_day_modis = ee.ImageCollection(eight_day_collection).filterDate(
+            start_date, end_date
+        )
+        composite = eight_day_modis.median()
 
-def setup_directories(base_dir):
-    """Create all required output directories."""
-    directories = {
-        "original": Path(base_dir) / "original",
-        "visualizations": Path(base_dir) / "visualizations",
-    }
-
-    # Create directories if they don't exist
-    for dir_path in directories.values():
-        dir_path.mkdir(exist_ok=True, parents=True)
-
-    # Ensure cache directory exists
-    Path(CACHE_DIR).mkdir(exist_ok=True, parents=True)
-
-    return directories
+    # Clip to the region of interest
+    return composite.clip(roi)
 
 
-def process_fire_record(fire_row, args, dirs):
-    """
-    Process a single fire record, saving only the original Sentinel image and the final composite visualization.
-    """
+def visualize_fire_hotspot(
+    row, buffer_km=100, days_before=20, output_dir="output", fast_mode=False
+):
+    """Generate visualization for a single fire hotspot"""
+    lat = row["latitude"]
+    lon = row["longitude"]
+    brightness = row["brightness"]
+    confidence = row["confidence"]
+    acq_date = row["acq_date"]
+
+    # Get satellite type from data (or default to Terra if not available)
+    satellite = row["satellite"] if "satellite" in row else "Terra"
+
+    # Create square region of interest
+    # Convert buffer distance from km to degrees (approximately)
+    # 1 degree of latitude is approximately 111 km
+    buffer_deg = buffer_km / 111.0  # Convert buffer to degrees
+
+    # Create a perfect square in meters projected around the point
+    # This ensures a proper square regardless of latitude
+    point = ee.Geometry.Point([lon, lat])
+    square = point.buffer(buffer_km * 1000, maxError=1).bounds()
+
+    # For visualization/reference, also calculate the approximate lat/lon bounds
+    lat_buffer = buffer_deg  # degrees of latitude
+    # Adjust longitude buffer based on latitude to maintain square shape
+    lon_buffer = buffer_deg / np.cos(np.radians(lat))
+
+    # Calculate lat/lon bounds for fire location overlay (smaller box)
+    fire_buffer_km = 5  # Use a smaller 5km buffer to highlight the fire location
+    fire_buffer_deg = fire_buffer_km / 111.0
+    fire_lat_buffer = fire_buffer_deg
+    fire_lon_buffer = fire_buffer_deg / np.cos(np.radians(lat))
+
+    # Use the properly projected square for ROI
+    roi = square
+
+    # Create date range (days before to day of acquisition)
+    end_date = datetime.strptime(acq_date, "%Y-%m-%d")
+    start_date = end_date - timedelta(days=days_before)
+
+    # Format dates for Earth Engine
+    start_date_str = start_date.strftime("%Y-%m-%d")
+    end_date_str = end_date.strftime("%Y-%m-%d")
+
+    # Create separate folders for raw and annotated images
+    raw_dir = os.path.join(output_dir, "raw_modis")
+    annotated_dir = os.path.join(output_dir, "annotated")
+    os.makedirs(raw_dir, exist_ok=True)
+    os.makedirs(annotated_dir, exist_ok=True)
+
     try:
-        # Get date components for organization
-        fire_date = pd.to_datetime(fire_row.acq_date)
-        fire_year = fire_date.strftime("%Y")
-        fire_month = fire_date.strftime("%m")
+        print(f"Processing fire hotspot at ({lat}, {lon}) from {acq_date}...")
+        print(f"Using {satellite} MODIS data with {buffer_km}km square AOI")
 
-        # Generate fire ID for consistent naming (using shorter format with date in folders)
-        fire_id = f"fire_{fire_row.geometry.y:.4f}_{fire_row.geometry.x:.4f}"
+        # Define visualization parameters based on available bands
+        visualization_done = False
 
-        # Compose the path for the composite file with date folders
-        vis_dir = dirs["visualizations"] / fire_year / fire_month
-        vis_dir.mkdir(exist_ok=True, parents=True)
-        composite_file = vis_dir / f"{fire_id}_composite.png"
+        # Try using MOD09GA/MYD09GA dataset first (500m resolution with good RGB bands)
+        try:
+            # Use higher quality MOD09GA/MYD09GA collections for better RGB composite
+            if satellite.lower() == "aqua":
+                ga_collection = "MODIS/061/MYD09GA"
+            else:
+                ga_collection = "MODIS/061/MOD09GA"
 
-        # Check if composite already exists
-        if composite_file.exists():
-            print(f"Composite visualization already exists for {fire_id}")
-            return {"composite": str(composite_file)}, False  # Already processed
+            ga_modis = ee.ImageCollection(ga_collection).filterDate(
+                start_date_str, end_date_str
+            )
 
-        # Get Sentinel image with custom parameters
-        sentinel_item = get_sentinel_image(
-            fire_row,
-            buffer_size=args.buffer_size,
-            cloud_cover_limit=args.cloud_limit,
-            search_days=args.search_days,
-            use_cache=not args.no_cache,
+            if ga_modis.size().getInfo() > 0:
+                print(f"Using higher quality {satellite} MODIS GA product (500m)")
+
+                # Use median composite to reduce cloud effects
+                ga_composite = ga_modis.median().clip(roi)
+
+                # For better visualization, try to stretch the image
+                ga_composite = ga_composite.unitScale(
+                    0, 3000
+                )  # Scale values between 0-1
+                ga_composite = ga_composite.multiply(
+                    255
+                )  # Scale to 0-255 for better display
+
+                # Get available bands
+                available_bands = ga_composite.bandNames().getInfo()
+                print(f"GA product bands: {available_bands}")
+
+                # First try to use fire-enhanced visualization
+                fire_vis_params, fire_note = get_fire_enhanced_visualization(
+                    ga_composite, available_bands, fast_mode
+                )
+
+                if fire_vis_params:
+                    visualization_params = fire_vis_params
+                    note = fire_note
+                elif (
+                    "sur_refl_b01" in available_bands
+                    and "sur_refl_b04" in available_bands
+                    and "sur_refl_b03" in available_bands
+                ):
+                    # True color RGB (red, green, blue)
+                    visualization_params = {
+                        "bands": ["sur_refl_b01", "sur_refl_b04", "sur_refl_b03"],
+                        "min": 0,
+                        "max": 255,  # Now scaled to 0-255
+                        "gamma": 1.2,  # Slightly lower gamma for better contrast
+                    }
+                    note = "True color RGB (bands 1,4,3)"
+                    print("Using true color RGB visualization")
+                else:
+                    # False color if true RGB not available
+                    first_band = available_bands[0]
+                    visualization_params = {
+                        "bands": [first_band, first_band, first_band],
+                        "min": 0,
+                        "max": 255,
+                        "gamma": 1.4,
+                    }
+                    note = f"Grayscale using band: {first_band}"
+                    print(f"Using grayscale with band: {first_band}")
+
+                # Get thumbnail URL using better quality data - larger dimensions for better detail
+                thumbnail_dimensions = 1024 if fast_mode else 2048
+
+                # ... in the thumbnail URL generation ...
+                thumbnail_url = ga_composite.getThumbURL(
+                    {
+                        **visualization_params,
+                        "dimensions": thumbnail_dimensions,
+                        "format": "jpg"
+                        if fast_mode
+                        else "png",  # Use JPEG for faster downloads in fast mode
+                    }
+                )
+                visualization_done = True
+
+                # Add info about the visualization
+                note = f"{note} - {satellite} MODIS data (500m resolution, {buffer_km}km square)"
+
+                # Save the raw composite for additional processing
+                composite = ga_composite
+
+            else:
+                print(f"No {ga_collection} data available for the specified date range")
+
+        except Exception as e:
+            print(
+                f"Error using enhanced MODIS data: {str(e)}. Falling back to standard products."
+            )
+
+        # Download the thumbnail to raw directory
+        img_file = os.path.join(
+            raw_dir,
+            f"{satellite.lower()}_modis_{start_date_str}_to_{end_date_str}.png",
         )
 
-        if not sentinel_item:
-            return None, False
+        # After downloading and displaying the image (around line 351):
+        if download_ee_image(thumbnail_url, img_file):
+            print(f"Raw MODIS image saved to: {img_file}")
 
-        results = {}
+            # Create enhanced versions directory
+            enhanced_dir = os.path.join(output_dir, "enhanced")
+            os.makedirs(enhanced_dir, exist_ok=True)
 
-        # Save original visual image from Sentinel (raw data preservation)
-        # Now using date-based organization (organize_by_date=True)
-        visual_path = save_image(
-            sentinel_item,
-            fire_row,
-            asset_key="visual",
-            output_dir=dirs["original"],
-            buffer_size=args.buffer_size,
-            dpi=300,
-            organize_by_date=True,
-        )
-        results["visual"] = visual_path
+            # Save additional fire-enhanced views if bands are available
+            try:
+                if all(
+                    band in available_bands
+                    for band in ["sur_refl_b07", "sur_refl_b02", "sur_refl_b01"]
+                ):
+                    # Fire detection view (7-2-1)
+                    fire_view_url = ga_composite.getThumbURL(
+                        {
+                            "bands": ["sur_refl_b07", "sur_refl_b02", "sur_refl_b01"],
+                            "min": 0,
+                            "max": 255,
+                            "gamma": 1.0,
+                            "dimensions": thumbnail_dimensions,
+                            "format": "jpg" if fast_mode else "png",
+                        }
+                    )
 
-        # Create the composite visualization directly
-        # Already uses date-based organization by default
-        composite_path = create_direct_composite_visualization(
-            fire_row,
-            sentinel_item=sentinel_item,
-            composite_types=[
-                "rgb",
-                "fire",
-                "nir",
-                "swir",
-                "nbr",
-                "dnbr",
-            ],
-            output_dir=dirs["visualizations"],
-            add_timestamp=False,
-            buffer_size=args.buffer_size,
-            organize_by_date=True,  # Explicitly set for consistency
-        )
-        results["composite"] = composite_path
+                    fire_view_file = os.path.join(
+                        enhanced_dir,
+                        f"{satellite.lower()}_fire721_{start_date_str}_to_{end_date_str}.png",
+                    )
+                    download_ee_image(fire_view_url, fire_view_file)
+                    print(f"Fire-enhanced view (7-2-1) saved to: {fire_view_file}")
 
-        # Only return success if at least one output was created
-        success = bool(visual_path or composite_path)
-        return results, success
+                if all(
+                    band in available_bands
+                    for band in ["sur_refl_b02", "sur_refl_b07", "sur_refl_b03"]
+                ):
+                    # Smoke detection view (2-7-3)
+                    smoke_view_url = ga_composite.getThumbURL(
+                        {
+                            "bands": ["sur_refl_b02", "sur_refl_b07", "sur_refl_b03"],
+                            "min": 0,
+                            "max": 255,
+                            "gamma": 1.0,
+                            "dimensions": thumbnail_dimensions,
+                            "format": "jpg" if fast_mode else "png",
+                        }
+                    )
+
+                    smoke_view_file = os.path.join(
+                        enhanced_dir,
+                        f"{satellite.lower()}_smoke273_{start_date_str}_to_{end_date_str}.png",
+                    )
+                    download_ee_image(smoke_view_url, smoke_view_file)
+                    print(f"Smoke detection view (2-7-3) saved to: {smoke_view_file}")
+            except Exception as e:
+                print(f"Error saving enhanced visualizations: {str(e)}")
+
+            # Create a figure with metadata
+            fig, ax = plt.subplots(figsize=(12, 10))  # Larger figure size
+
+            # Display the image
+            img = plt.imread(img_file)
+            ax.imshow(img)
+
+            # Draw a red box around the fire location (center of image)
+            height, width = img.shape[:2]
+            center_x, center_y = width / 2, height / 2
+
+            # Calculate the size of the fire overlay box (proportional to the fire_buffer)
+            box_size_x = (fire_lon_buffer / (lon_buffer * 2)) * width
+            box_size_y = (fire_lat_buffer / (lat_buffer * 2)) * height
+
+            # Draw the fire location box
+            from matplotlib.patches import Rectangle
+
+            fire_rect = Rectangle(
+                (center_x - box_size_x, center_y - box_size_y),
+                2 * box_size_x,
+                2 * box_size_y,
+                linewidth=2,
+                edgecolor="r",
+                facecolor="none",
+            )
+            ax.add_patch(fire_rect)
+
+            # Add fire highlight with yellow glow if using fire-enhanced visualization
+            if "fire" in note.lower():
+                # Add a semi-transparent yellow overlay to highlight the fire area
+                fire_highlight = Rectangle(
+                    (center_x - box_size_x * 1.2, center_y - box_size_y * 1.2),
+                    2 * box_size_x * 1.2,
+                    2 * box_size_y * 1.2,
+                    linewidth=2,
+                    edgecolor="yellow",
+                    facecolor="yellow",
+                    alpha=0.15,
+                )
+                ax.add_patch(fire_highlight)
+
+                # Add informational text about the fire visualization
+                ax.text(
+                    0.5,
+                    0.95,
+                    "FIRE ENHANCED VIEW: Active fire appears bright in this band combination",
+                    color="yellow",
+                    fontweight="bold",
+                    ha="center",
+                    va="top",
+                    transform=ax.transAxes,
+                    bbox=dict(facecolor="black", alpha=0.5),
+                    fontsize=12,
+                )
+
+            # Add a marker at the fire center
+            ax.plot(center_x, center_y, "rx", markersize=10, markeredgewidth=2)
+
+            # Add metadata as text
+            ax.set_title(f"{satellite} MODIS Fire Hotspot ({lat}, {lon})", fontsize=16)
+
+            # Add "FIRE LOCATION" label near the box
+            ax.text(
+                center_x,
+                center_y - box_size_y - 5,
+                "FIRE LOCATION",
+                color="red",
+                fontweight="bold",
+                ha="center",
+                fontsize=10,
+            )
+
+            # Add more detailed metadata
+            metadata_text = (
+                f"Date: {acq_date}\n"
+                f"Satellite: {satellite}\n"
+                f"Brightness: {brightness:.1f}K\n"
+                f"Confidence: {confidence}%\n"
+                f"Period: {start_date_str} to {end_date_str}\n"
+                f"Visualization: {note}\n"
+                f"Buffer zone: {buffer_km}km"
+            )
+
+            ax.text(
+                0.02,
+                0.02,
+                metadata_text,
+                transform=ax.transAxes,
+                bbox=dict(facecolor="white", alpha=0.8),
+                fontsize=12,
+            )
+
+            # If we're using a special visualization, add explanation
+            if "fire enhanced" in note.lower():
+                fire_legend = (
+                    "In this visualization:\n"
+                    "• Bright spots: Active fire\n"
+                    "• Red/pink: Recently burned areas\n"
+                    "• Green: Healthy vegetation\n"
+                    "• Blue/gray: Smoke plumes"
+                )
+
+                ax.text(
+                    0.98,
+                    0.1,
+                    fire_legend,
+                    transform=ax.transAxes,
+                    bbox=dict(facecolor="black", alpha=0.7),
+                    fontsize=10,
+                    color="white",
+                    ha="right",
+                )
+
+            ax.axis("off")
+
+            # Save the annotated figure to annotated directory
+            annotated_file = os.path.join(
+                annotated_dir,
+                f"{satellite.lower()}_annotated_{start_date_str}_to_{end_date_str}.png",
+            )
+            plt.savefig(annotated_file, dpi=300, bbox_inches="tight")
+            plt.close(fig)
+
+            print(f"Annotated visualization saved to: {annotated_file}")
+            return annotated_file
 
     except Exception as e:
-        print(f"Error processing fire record: {str(e)}")
-        traceback.print_exc()
-        return None, False
+        print(f"Error processing hotspot at ({lat}, {lon}): {str(e)}")
+
+    return None
 
 
-def process_batch(batch, args, dirs):
-    """Process a batch of fire records with parallel processing."""
+def get_fire_enhanced_visualization(ga_composite, available_bands, fast_mode=False):
+    """
+    Create a visualization that enhances fire and smoke visibility.
+    Returns visualization parameters and a description note.
+    """
+    # Define all the band combinations we want to try, in order of preference
+    visualization_options = [
+        {
+            "bands": ["sur_refl_b07", "sur_refl_b02", "sur_refl_b01"],
+            "description": "Fire enhanced (SWIR, NIR, Red - bands 7,2,1)",
+            "note": "Using fire-enhanced visualization (SWIR, NIR, Red)",
+        },
+        {
+            "bands": ["sur_refl_b07", "sur_refl_b06", "sur_refl_b04"],
+            "description": "Fire detection (SWIR, SWIR, Green - bands 7,6,4)",
+            "note": "Using alternate fire detection visualization (SWIR, SWIR, Green)",
+        },
+        {
+            "bands": ["sur_refl_b02", "sur_refl_b07", "sur_refl_b03"],
+            "description": "Smoke detection (NIR, SWIR, Blue - bands 2,7,3)",
+            "note": "Using smoke detection visualization (NIR, SWIR, Blue)",
+        },
+    ]
 
-    # Calculate optimal worker count
-    max_workers = min(32, multiprocessing.cpu_count() + 4)
-    processed_count = 0
-    success_count = 0
-    results = []
+    # Try each option in order
+    for option in visualization_options:
+        if all(band in available_bands for band in option["bands"]):
+            visualization_params = {
+                "bands": option["bands"],
+                "min": 0,
+                "max": 255,
+                "gamma": 1.0,
+            }
+            console.print(f"[green]{option['note']}[/green]")
+            return visualization_params, option["description"]
 
-    # Define processing function for a single record
-    def process_single(row_data):
-        _, fire_row = row_data
-        try:
-            result, success = process_fire_record(fire_row, args, dirs)
-            return (result, success, fire_row.name)
-        except Exception as e:
-            print(f"Error processing record {fire_row.name}: {str(e)}")
-            return (None, False, fire_row.name)
+    return None, None
 
-    # Process in parallel
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(process_single, row): row for row in batch.iterrows()
-        }
 
-        # Show progress bar
-        from tqdm import tqdm
+def create_summary_visualization(image_paths, output_dir):
+    """Create a summary visualization of multiple fire hotspots"""
+    if not image_paths:
+        print("No images to create summary visualization")
+        return None
 
-        for future in tqdm(
-            concurrent.futures.as_completed(futures),
-            total=len(futures),
-            desc="Processing",
-        ):
-            result, success, idx = future.result()
+    # Determine grid layout
+    n = len(image_paths)
+    cols = min(3, n)
+    rows = (n + cols - 1) // cols  # Ceiling division
 
-            if success:
-                success_count += 1
+    # Create figure
+    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 5 * rows))
+    if n == 1:
+        axes = np.array([axes])  # Make axes indexable for a single subplot
+    axes = axes.flatten()  # Flatten to make indexing easier
 
-            if result is not None:
-                processed_count += 1
+    # Add each image to the grid
+    for i, img_path in enumerate(image_paths):
+        if i < len(axes):
+            try:
+                # Extract location from filename
+                img_name = os.path.basename(os.path.dirname(img_path))
 
-            results.append((idx, result, success))
+                # Load and display image
+                img = plt.imread(img_path)
+                axes[i].imshow(img)
+                axes[i].set_title(f"Hotspot {i + 1}: {img_name}")
+                axes[i].axis("off")
+            except Exception as e:
+                print(f"Error adding image {img_path} to summary: {str(e)}")
+                axes[i].text(
+                    0.5,
+                    0.5,
+                    "Image load error",
+                    ha="center",
+                    va="center",
+                    transform=axes[i].transAxes,
+                )
+                axes[i].axis("off")
 
-    return processed_count, success_count
+    # Hide unused subplots
+    for i in range(n, len(axes)):
+        axes[i].axis("off")
+
+    # Save the summary figure
+    plt.tight_layout()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    summary_path = os.path.join(output_dir, f"fire_summary_{timestamp}.png")
+    plt.savefig(summary_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"Summary visualization saved to: {summary_path}")
+    return summary_path
 
 
 def main():
-    """Main function to process all fire data with batching and customization options."""
-    start_time = time.time()
+    # Create argument parser
+    parser = argparse.ArgumentParser(
+        description="Process fire hotspot data from MODIS/VIIRS satellites"
+    )
+    parser.add_argument(
+        "--max-hotspots",
+        type=int,
+        default=10,
+        help="Maximum number of hotspots to process. Set to 0 to process all hotspots.",
+    )
+    parser.add_argument(
+        "--min-confidence",
+        type=int,
+        default=90,
+        help="Minimum confidence threshold for hotspot detection (0-100)",
+    )
+    parser.add_argument(
+        "--csv-path",
+        type=str,
+        default="data_csv/fire_archive_M-C61_589118.csv",
+        help="Path to the CSV file containing fire hotspot data",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of parallel workers for processing (default: 4)",
+    )
+    parser.add_argument(
+        "--fast-mode",
+        action="store_true",
+        help="Enable fast mode (fewer retries, smaller images)",
+    )
+    args = parser.parse_args()
 
-    try:
-        # Parse command line arguments
-        args = parse_arguments()
+    matplotlib.use("Agg")
 
-        # Check if we should run storage optimization
-        if args.optimize_storage:
-            from utils.visualization import batch_optimize_images
+    # Set paths
+    csv_path = os.path.join(args.csv_path)
+    output_dir = os.path.join(os.path.dirname(__file__), "output")
+    os.makedirs(output_dir, exist_ok=True)
 
-            print(f"\n{'=' * 60}")
-            print("Fire Satellite Image Crawler - Storage Optimization")
-            print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            print(f"{'=' * 60}")
-            print("Running storage optimization for existing images...")
+    # Load fire data
+    console.print("[bold yellow]Loading fire hotspot data...[/bold yellow]")
+    fire_data = load_fire_data(csv_path)
+    if fire_data is None:
+        console.print("[bold red]Failed to load fire data. Exiting.[/bold red]")
+        return
 
-            batch_optimize_images(
-                directory=args.output_dir,
-                recursive=True,
-                delete_originals=args.delete_originals,
-                jpeg_quality=args.jpeg_quality,
-            )
+    # Filter to get high-confidence hotspots
+    console.print(
+        "[bold yellow]Filtering for high-confidence fire hotspots...[/bold yellow]"
+    )
 
-            # Calculate and display execution time
-            elapsed_time = time.time() - start_time
-            hours, rem = divmod(elapsed_time, 3600)
-            minutes, seconds = divmod(rem, 60)
+    # Determine max_hotspots (use all if set to 0)
+    max_hotspots = len(fire_data) if args.max_hotspots == 0 else args.max_hotspots
 
-            print(f"\n{'=' * 60}")
-            print(
-                f"Optimization complete at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            )
-            print(
-                f"Total execution time: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
-            )
-            print(f"{'=' * 60}")
+    # Filter the data based on command line arguments
+    top_hotspots = filter_fire_data(
+        fire_data, min_confidence=args.min_confidence, max_hotspots=max_hotspots
+    )
 
-            # Exit after optimization
-            return
+    total_hotspots = len(top_hotspots)
+    console.print(
+        f"[bold green]Processing {total_hotspots} fire hotspots...[/bold green]"
+    )
 
-        # Print selected options
-        print(f"\n{'=' * 60}")
-        print("Fire Satellite Image Crawler")
-        print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"{'=' * 60}")
-        print("Processing with options:")
-        print(f"  Batch size: {args.batch_size}")
-        print(f"  Cloud cover limit: {args.cloud_limit}%")
-        print(f"  Search days: {args.search_days} days before/after")
-        print(f"  Buffer size: {args.buffer_size} degrees")
-        print(f"  Caching: {'disabled' if args.no_cache else 'enabled'}")
-        print(f"  Output directory: {args.output_dir}")
-        print(f"  Create composites: {'yes' if args.create_composites else 'no'}")
-        print(f"  Organize by date: {'yes' if args.organize_by_date else 'no'}")
+    image_paths = []
 
-        # Setup directory structure
-        dirs = setup_directories(args.output_dir)
+    # Define a simplified processing function for parallel execution
+    def process_hotspot(row_data):
+        row_index, (_, row) = row_data  # Correctly unpack the tuple from iterrows()
 
-        # Load fire data
-        print("\nLoading fire data...")
-        fires = load_fire_data()
+        # Use adaptive buffer size based on fire brightness
+        brightness = row["brightness"]
 
-        # Apply filters
-        fires = filter_fire_data(fires, args)
-
-        if len(fires) == 0:
-            print("No fire records to process after applying filters.")
-            return
-
-        # Process fires in batches
-        batch_size = args.batch_size
-        total_processed = 0
-        total_success = 0
-
-        print(f"\nProcessing {len(fires)} fire records in batches of {batch_size}:")
-
-        for batch_start in range(0, len(fires), batch_size):
-            batch_end = min(batch_start + batch_size, len(fires))
-            print(
-                f"\nBatch {batch_start // batch_size + 1}: records {batch_start + 1}-{batch_end} of {len(fires)}"
-            )
-
-            # Get the current batch
-            batch = fires.iloc[batch_start:batch_end]
-
-            # Process the batch
-            processed, success = process_batch(batch, args, dirs)
-            total_processed += processed
-            total_success += success
-
-            # Print batch summary
-            print(
-                f"Batch {batch_start // batch_size + 1} complete: {success} successful, {batch_end - batch_start - processed} skipped"
-            )
-
-            # Force garbage collection between batches to free memory
-            gc.collect()
-
-            # Short delay to let system stabilize
-            time.sleep(1)
-
-        # Calculate and display execution time
-        elapsed_time = time.time() - start_time
-        hours, rem = divmod(elapsed_time, 3600)
-        minutes, seconds = divmod(rem, 60)
-
-        print(f"\n{'=' * 60}")
-        print(f"Processing complete at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(
-            f"Total execution time: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
+        # Calculate initial buffer size
+        initial_buffer = (
+            min(200 + (brightness - 300) * 0.5, 300) if brightness > 300 else 200
         )
-        print(f"Processed {total_processed} fire records ({total_success} successful)")
-        print(f"{'=' * 60}")
 
-    except KeyboardInterrupt:
-        elapsed_time = time.time() - start_time
-        hours, rem = divmod(elapsed_time, 3600)
-        minutes, seconds = divmod(rem, 60)
+        # Use fewer options in fast mode
+        if args.fast_mode:
+            buffer_options = [initial_buffer]
+            day_options = [20]
+        else:
+            buffer_options = [
+                initial_buffer,
+                initial_buffer * 1.5,
+                initial_buffer * 0.75,
+            ]
+            day_options = [20, 30, 10]
 
-        print(f"\n{'=' * 60}")
-        print(
-            f"\nProcessing interrupted by user at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        for buffer_size in buffer_options:
+            for days in day_options:
+                console.print(
+                    f"[cyan]Hotspot {row_index + 1}/{total_hotspots}: Trying {int(buffer_size)}km buffer with {days} days lookback[/cyan]"
+                )
+
+                img_path = visualize_fire_hotspot(
+                    row,
+                    buffer_km=int(buffer_size),
+                    days_before=days,
+                    output_dir=output_dir,
+                    fast_mode=args.fast_mode,
+                )
+
+                if img_path:
+                    console.print(
+                        f"[green]Hotspot {row_index + 1}/{total_hotspots}: Successfully visualized fire at ({row['latitude']}, {row['longitude']})[/green]"
+                    )
+                    return img_path
+
+        console.print(
+            f"[bold red]Hotspot {row_index + 1}/{total_hotspots}: Failed to visualize fire at ({row['latitude']}, {row['longitude']})[/bold red]"
         )
-        print(f"Elapsed time: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}")
-        print("Progress up to this point has been saved.")
-        print(f"{'=' * 60}")
+        return None
 
-    except Exception as e:
-        print(f"\nError in main processing: {str(e)}")
-        traceback.print_exc()
+    # Process hotspots (in parallel if workers > 1)
+    if args.workers > 1:
+        # Setup for parallel processing
+        executor = None
+        should_exit = False
+        futures_to_process = {}
+
+        # Define handlers for graceful shutdown
+        def signal_handler(sig, frame):
+            nonlocal should_exit
+            if not should_exit:
+                console.print(
+                    "\n[bold red]Received interrupt signal. Shutting down gracefully...[/bold red]"
+                )
+                console.print(
+                    "[yellow]Waiting for current tasks to complete (This may take a moment)...[/yellow]"
+                )
+                console.print(
+                    "[yellow]Press Ctrl+C again to force immediate exit (may corrupt files)[/yellow]"
+                )
+                should_exit = True
+
+                # Cancel pending tasks but let running ones complete
+                for future in list(futures_to_process.keys()):
+                    if not future.running():
+                        future.cancel()
+
+                signal.signal(signal.SIGINT, force_exit_handler)
+
+        def force_exit_handler(sig, frame):
+            console.print(
+                "\n[bold red]Forced exit requested. Terminating immediately.[/bold red]"
+            )
+            sys.exit(1)
+
+        # Set up signal handlers
+        original_sigint_handler = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, signal_handler)
+
+        try:
+            # Prepare data for processing
+            task_data = [
+                (i, row_tuple) for i, row_tuple in enumerate(top_hotspots.iterrows())
+            ]
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=args.workers
+            ) as executor:
+                # Submit initial batch of tasks (limit concurrency to avoid overwhelming EE API)
+                batch_size = min(args.workers * 2, len(task_data))
+                initial_tasks = task_data[:batch_size]
+                remaining_tasks = task_data[batch_size:]
+
+                # Submit initial batch
+                futures_to_process = {
+                    executor.submit(process_hotspot, item): item
+                    for item in initial_tasks
+                }
+
+                # Process results as they complete and submit new tasks
+                while futures_to_process and not should_exit:
+                    # Wait for the next result
+                    done, not_done = concurrent.futures.wait(
+                        futures_to_process,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                        timeout=1.0,  # Small timeout to check should_exit periodically
+                    )
+
+                    # Process completed futures
+                    for future in done:
+                        item = futures_to_process.pop(future)
+
+                        try:
+                            img_path = future.result()
+                            if img_path:
+                                image_paths.append(img_path)
+
+                                # Add progress information
+                                idx = item[0]
+                                completed = len(image_paths)
+                                console.print(
+                                    f"[green]Progress: {completed}/{total_hotspots} hotspots processed "
+                                    f"({completed / total_hotspots * 100:.1f}%)[/green]"
+                                )
+
+                        except Exception as e:
+                            console.print(
+                                f"[bold red]Error processing hotspot {item[0] + 1}: {str(e)}[/bold red]"
+                            )
+
+                        # Submit a new task if available
+                        if remaining_tasks and not should_exit:
+                            new_item = remaining_tasks.pop(0)
+                            futures_to_process[
+                                executor.submit(process_hotspot, new_item)
+                            ] = new_item
+
+                if should_exit:
+                    console.print(
+                        "[yellow]Graceful shutdown in progress. Saving completed work...[/yellow]"
+                    )
+
+        except KeyboardInterrupt:
+            console.print(
+                "\n[bold red]KeyboardInterrupt caught in outer block. Exiting...[/bold red]"
+            )
+
+        finally:
+            # Restore original signal handler
+            signal.signal(signal.SIGINT, original_sigint_handler)
+
+    else:
+        # Sequential processing with progress tracking
+        try:
+            for i, row_tuple in enumerate(
+                track(
+                    list(top_hotspots.iterrows()),
+                    description="Processing hotspots",
+                    total=total_hotspots,
+                )
+            ):
+                img_path = process_hotspot((i, row_tuple))
+                if img_path:
+                    image_paths.append(img_path)
+
+                    # Show occasional progress
+                    if (i + 1) % 5 == 0 or i + 1 == total_hotspots:
+                        console.print(
+                            f"[green]Progress: {len(image_paths)}/{i + 1} successful out of {total_hotspots} total[/green]"
+                        )
+
+        except KeyboardInterrupt:
+            console.print(
+                "\n[bold red]Processing interrupted. Saving completed work...[/bold red]"
+            )
+
+    # Create summary visualization with whatever we have completed
+    if image_paths:
+        console.print("[bold green]Creating summary visualization...[/bold green]")
+        try:
+            create_summary_visualization(image_paths, output_dir)
+        except Exception as e:
+            console.print(f"[bold red]Error creating summary: {str(e)}[/bold red]")
+
+    console.print(
+        f"[bold green]Processing complete! {len(image_paths)}/{total_hotspots} hotspots successfully processed.[/bold green]"
+    )
 
 
 if __name__ == "__main__":
+    console = Console()
+    console.print(
+        "[bold blue]Starting Fire Hotspot Analysis with Google Earth Engine[/bold blue]"
+    )
     main()
